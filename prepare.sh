@@ -12,3 +12,5 @@ unzip ./data/valid.zip -d ./data/
 
 rm ./data/train.zip
 rm ./data/valid.zip
+
+pip install -r requirements.txt
