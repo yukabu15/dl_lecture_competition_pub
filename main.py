@@ -5,13 +5,12 @@ from statistics import mode
 
 from PIL import Image
 import numpy as np
-import pandas
+import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModel
 
 def set_seed(seed):
     random.seed(seed)
@@ -67,23 +66,23 @@ class VQADataset(torch.utils.data.Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+        self.df = pd.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
 
         # question / answerの辞書を作成
-        self.question2idx = {}
+#         self.question2idx = {}
         self.answer2idx = {}
-        self.idx2question = {}
+#         self.idx2question = {}
         self.idx2answer = {}
 
         # 質問文に含まれる単語を辞書に追加
         for question in self.df["question"]:
             question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+#            words = question.split(" ")
+#            for word in words:
+#                if word not in self.question2idx:
+#                    self.question2idx[word] = len(self.question2idx)
+#         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
         if self.answer:
             # 回答に含まれる単語を辞書に追加
@@ -104,10 +103,19 @@ class VQADataset(torch.utils.data.Dataset):
         dataset : Dataset
             訓練データのDataset
         """
-        self.question2idx = dataset.question2idx
+        #self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
+        #self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
+    
+    def update_dict_with_corpus(self, corpus_path):
+        corpus = pd.read_csv(corpus_path)
+        
+        for answer in corpus.loc[:, 'answer']:
+            answer = process_text(answer)
+            if answer not in self.answer2idx:
+                self.answer2idx[answer] = len(self.answer2idx)
+        self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
     def __getitem__(self, idx):
         """
@@ -129,7 +137,7 @@ class VQADataset(torch.utils.data.Dataset):
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
         """
-        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
+        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}") 
         image = self.transform(image)
         
         question = self.df["question"][idx]
@@ -283,18 +291,11 @@ def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
 
-def mean_pooling(model_output, attention_mask):
-    token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-
-
 class VQAModel(nn.Module):
     def __init__(self, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
-        self.text_encoder = AutoModel.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
+        self.resnet = ResNet50()
+        self.sentence_transformer = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
 
         self.fc = nn.Sequential(
             nn.Linear(512 + 768, 512),
@@ -304,12 +305,7 @@ class VQAModel(nn.Module):
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        encoded_input = self.tokenizer(question, padding=True, truncation=True, max_length=128, return_tensors='pt').to(image.device)
-        
-        with torch.no_grad():
-            model_output = self.text_encoder(**encoded_input)
-            
-        question_feature = mean_pooling(model_output, encoded_input['attention_mask']).to(image.device)  # テキストの特徴量
+        question_feature = self.sentence_transformer.encode(question, convert_to_tensor=True).to(image.device)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -366,19 +362,33 @@ def eval(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
+class GCN:
+    def __init__(self):
+        pass
+
+    def __call__(self, x):
+        mean = torch.mean(x)
+        std = torch.std(x)
+        return (x - mean) / (std + 10**(-6))  # 0除算を防ぐ
+
+    
 def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # dataloader / model
+    gcn = GCN()
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        gcn
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
+    train_dataset.update_dict_with_corpus(corpus_path = "./class_mapping.csv")
+    test_dataset.update_dict_with_corpus(corpus_path = "./class_mapping.csv")
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
